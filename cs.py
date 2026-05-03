@@ -34,11 +34,34 @@ def load_data(path: str = "cs-training.csv") -> pd.DataFrame:
     return pd.read_csv(path, index_col=0)
 
 
-def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
+def fit_preprocess_params(df: pd.DataFrame) -> dict:
+    df_fit = df[df["age"] > 0].copy()
+    winsor_p99 = {col: df_fit[col].quantile(0.99) for col in WINSOR_COLS}
+    median_dep = df_fit["NumberOfDependents"].median()
+    monthly_income_median = df_fit["MonthlyIncome"].median()
+    artifact_medians = {}
+    for col in ARTIFACT_COLS:
+        artifact_medians[col] = df_fit[col].replace(96, np.nan).median()
+
+    return {
+        "winsor_p99": winsor_p99,
+        "median_dep": median_dep,
+        "monthly_income_median": monthly_income_median,
+        "artifact_medians": artifact_medians,
+    }
+
+
+def preprocess_data(
+    df: pd.DataFrame, params: dict, is_train: bool = True
+) -> pd.DataFrame:
     df_clean = df.copy()
 
-    # 1) Удаляем некорректные наблюдения
-    df_clean = df_clean[df_clean["age"] > 0]
+    # Для train удаляем age <= 0, для test сохраняем все строки.
+    if is_train:
+        df_clean = df_clean[df_clean["age"] > 0]
+    else:
+        valid_age_median = df_clean.loc[df_clean["age"] > 0, "age"].median()
+        df_clean.loc[df_clean["age"] <= 0, "age"] = valid_age_median
 
     # 2) Заменяем артефакт 96 на NaN
     for col in ARTIFACT_COLS:
@@ -49,21 +72,24 @@ def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
         "RevolvingUtilizationOfUnsecuredLines"
     ].clip(upper=1.0)
     for col in WINSOR_COLS:
-        p99 = df_clean[col].quantile(0.99)
+        p99 = params["winsor_p99"][col]
         df_clean[col] = df_clean[col].clip(upper=p99)
 
     # 4) Импутация пропусков
-    median_dep = df_clean["NumberOfDependents"].median()
+    median_dep = params["median_dep"]
     df_clean["NumberOfDependents"] = df_clean["NumberOfDependents"].fillna(median_dep)
 
     df_clean["age_group"] = pd.cut(df_clean["age"], bins=AGE_BINS)
     df_clean["MonthlyIncome"] = df_clean.groupby("age_group", observed=True)[
         "MonthlyIncome"
     ].transform(lambda x: x.fillna(x.median()))
+    df_clean["MonthlyIncome"] = df_clean["MonthlyIncome"].fillna(
+        params["monthly_income_median"]
+    )
     df_clean = df_clean.drop(columns="age_group")
 
     for col in ARTIFACT_COLS:
-        df_clean[col] = df_clean[col].fillna(df_clean[col].median())
+        df_clean[col] = df_clean[col].fillna(params["artifact_medians"][col])
 
     # 5) Инженерия признаков по просрочкам
     df_clean["TotalLatePayments"] = df_clean[LATE_COLS].sum(axis=1)
@@ -100,6 +126,15 @@ def train_model(X_train_scaled: np.ndarray, y_train: pd.Series) -> LogisticRegre
     return model
 
 
+def train_full_pipeline(
+    X: pd.DataFrame, y: pd.Series
+) -> tuple[LogisticRegression, StandardScaler]:
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    model = train_model(X_scaled, y)
+    return model, scaler
+
+
 def calculate_scorecard_points(y_pred_proba: np.ndarray) -> np.ndarray:
     factor = PDO / np.log(2)
     offset = BASE_SCORE - factor * np.log(ODDS)
@@ -123,15 +158,41 @@ def print_score_stats(scores: np.ndarray, y_test: pd.Series) -> None:
     print(f"Средний скор дефолтников:      {scores_series[y_test == 1].mean():.0f}")
 
 
+def make_kaggle_submission(
+    model: LogisticRegression,
+    scaler: StandardScaler,
+    params: dict,
+    train_features: pd.DataFrame,
+    test_path: str = "cs-test.csv",
+    out_path: str = "submission.csv",
+) -> None:
+    df_test = load_data(test_path)
+    df_test_clean = preprocess_data(df_test, params=params, is_train=False)
+    df_test_clean = df_test_clean.reindex(columns=train_features.columns)
+
+    X_submission = scaler.transform(df_test_clean)
+    submission_proba = model.predict_proba(X_submission)[:, 1]
+
+    submission = pd.DataFrame(
+        {"Id": df_test_clean.index, "Probability": submission_proba}
+    )
+    submission.to_csv(out_path, index=False)
+
+    print(f"\nСабмит сохранён в {out_path}")
+    print(submission.head(10).to_string(index=False))
+    print(f"\nСтрок в submission: {len(submission)}")
+
+
 def main() -> None:
     df = load_data()
-    df_clean = preprocess_data(df)
+    preprocess_params = fit_preprocess_params(df)
+    df_clean = preprocess_data(df, params=preprocess_params, is_train=True)
 
     X, y = build_features_target(df_clean)
     X_train_scaled, X_test_scaled, y_train, y_test = split_and_scale(X, y)
-    model = train_model(X_train_scaled, y_train)
+    eval_model = train_model(X_train_scaled, y_train)
 
-    y_pred_proba = model.predict_proba(X_test_scaled)[:, 1]
+    y_pred_proba = eval_model.predict_proba(X_test_scaled)[:, 1]
 
     auc = roc_auc_score(y_test, y_pred_proba)
     gini = 2 * auc - 1
@@ -139,7 +200,7 @@ def main() -> None:
     print(f"Gini: {gini:.4f}")
 
     coef_df = pd.DataFrame(
-        {"feature": X.columns, "coefficient": model.coef_[0]}
+        {"feature": X.columns, "coefficient": eval_model.coef_[0]}
     )
     coef_df["odds_ratio"] = np.exp(coef_df["coefficient"])
     coef_df["abs_coef"] = coef_df["coefficient"].abs()
@@ -149,6 +210,17 @@ def main() -> None:
 
     scores = calculate_scorecard_points(y_pred_proba)
     print_score_stats(scores, y_test)
+
+    # Финальное обучение на всех train-данных для Kaggle сабмита.
+    final_model, final_scaler = train_full_pipeline(X, y)
+    make_kaggle_submission(
+        final_model,
+        final_scaler,
+        preprocess_params,
+        train_features=X,
+        test_path="cs-test.csv",
+        out_path="submission.csv",
+    )
 
 
 if __name__ == "__main__":
